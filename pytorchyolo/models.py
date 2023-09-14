@@ -204,7 +204,7 @@ class Darknet(nn.Module):
         # [seen] np.uint64(C++) or size_t(C++, 8 bytes) here, or 4 bytes, decided by header's version
         self.seen = np.uint64(0)
 
-    def forward(self, x):
+    def forward(self, x, dump=False):
         img_size = x.size(2)
         layer_outputs, yolo_outputs = [], []
         for i, (module_def, module) in enumerate(zip(self.module_defs, self.module_list)):
@@ -219,12 +219,17 @@ class Darknet(nn.Module):
                 layer_i = int(module_def["from"])
                 x = layer_outputs[-1] + layer_outputs[layer_i]
             elif module_def["type"] == "yolo":
-                x = module[0](x, img_size)
+                if not dump:
+                    x = module[0](x, img_size)
+                else:
+                    bs, n, ny, nx = x.shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
+                    x = x.view(bs, 3, n // 3, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
+                    x = x.view(bs, -1, n // 3)
                 yolo_outputs.append(x)
             layer_outputs.append(x)
         return yolo_outputs if self.training else torch.cat(yolo_outputs, 1)
 
-    def load_darknet_weights(self, weights_path):
+    def load_darknet_weights(self, weights_path, load_partially=False, actual_num_cls=-1):
         """Parses and loads the weights stored in 'weights_path'"""
 
         # Open the weights file
@@ -256,6 +261,45 @@ class Darknet(nn.Module):
             if i == cutoff:
                 break
             if module_def["type"] == "convolutional":
+                is_last_conv = i < (len(self.module_defs) - 1) and isinstance(self.module_list[i+1][0], YOLOLayer)
+                if load_partially and is_last_conv:
+                    with_bn = module_def["batch_normalize"]
+                    num_bias = module[1].bias.numel() if with_bn else module[0].bias.numel()
+                    num_weight = module[0].weight.numel()
+                    num_input = num_weight // num_bias
+                    num_output = num_bias # All 1x1 filters
+                    num_output_copy = (actual_num_cls+5)*3
+                    print("[Modified Layer #%d] BN=%d, #BIAS=%d, #WEIGHT=%d, #INPUT=%d, #OUTPUT=%d, #OUTPUT_COPY=%d" %
+                            (i, with_bn, num_bias, num_weight, num_input, num_output, num_output_copy))
+                    assert(not with_bn)
+                    num_pred = num_output // 3
+                    num_pred_copy = num_output_copy // 3
+                    # Copy Bias
+                    # Ensure sigmoid()'s output is nearly 0 for box_conf and cls_conf of all unused classes
+                    conv_b = torch.full_like(module[0].bias, -100)
+                    conv_b_copy = torch.from_numpy(weights[ptr: ptr+num_output_copy])
+                    conv_b_copy = conv_b_copy.reshape(num_output_copy)
+                    conv_b_copy_anchor_a = conv_b_copy[:num_pred_copy]
+                    conv_b_copy_anchor_b = conv_b_copy[num_pred_copy:num_pred_copy*2]
+                    conv_b_copy_anchor_c = conv_b_copy[num_pred_copy*2:]
+                    conv_b[:num_pred_copy] = conv_b_copy_anchor_a
+                    conv_b[num_pred:num_pred+num_pred_copy] = conv_b_copy_anchor_b
+                    conv_b[2*num_pred:2*num_pred+num_pred_copy] = conv_b_copy_anchor_c
+                    module[0].bias.data.copy_(conv_b)
+                    ptr += num_output_copy
+                    # Copy Weights
+                    conv_w = torch.zeros_like(module[0].weight)
+                    conv_w_copy = torch.from_numpy(weights[ptr: ptr+num_input*num_output_copy])
+                    conv_w_copy = conv_w_copy.reshape((num_output_copy, num_input, 1, 1))
+                    conv_w_copy_anchor_a = conv_w_copy[:num_pred_copy,...]
+                    conv_w_copy_anchor_b = conv_w_copy[num_pred_copy:num_pred_copy*2,...]
+                    conv_w_copy_anchor_c = conv_w_copy[num_pred_copy*2:,...]
+                    conv_w[:num_pred_copy,...] = conv_w_copy_anchor_a
+                    conv_w[num_pred:num_pred+num_pred_copy,...] = conv_w_copy_anchor_b
+                    conv_w[2*num_pred:2*num_pred+num_pred_copy,...] = conv_w_copy_anchor_c
+                    module[0].weight.data.copy_(conv_w)
+                    ptr += num_input * num_output_copy
+                    continue
                 conv_layer = module[0]
                 if module_def["batch_normalize"]:
                     # Load BN bias, weights, running mean and running variance
